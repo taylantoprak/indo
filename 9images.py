@@ -335,29 +335,45 @@ def process_vendor_data(vendor, start_date, end_date):
     next_page = ''
     data = request_data(vendor, start_date, end_date, next_page)
     totall = 0
+    page_count = 0
+    max_pages = 100  # Safety limit to prevent infinite loops
     
     if data:
         pag_data = data.get('result', {}).get('pagination', {})
         next_page = check_pagination(pag_data)
 
-    while next_page:
-        # Ensure the API request was successful before processing
+    # Process the first page of data
+    if data:
+        extracted_data = extract_data(data)
+        totall = totall + len(extracted_data)
+        print(f"Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
+        All_data = pd.concat([All_data, extracted_data], ignore_index=True)
+
+    # Continue pagination while there are more pages
+    while next_page and page_count < max_pages:
+        page_count += 1
+        print(f"Vendor {vendor} - Processing page {page_count}", flush=True)
+        
+        # Fetch the next page
+        data = request_data(vendor, start_date, end_date, next_page)
+        
+        # Check if the API request was successful
         if data:
             extracted_data = extract_data(data)
             totall = totall + len(extracted_data)
             print(f"Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
             All_data = pd.concat([All_data, extracted_data], ignore_index=True)
 
-            pag_data = data.get('result', {}).get('pagination', {})  # Safely retrieve pagination data
-            next_page = check_pagination(pag_data)  # Get the next page token
-
-            if next_page is None:
-                break  # Stop pagination if no next page
-
-            # Fetch the next page
-            data = request_data(vendor, start_date, end_date, next_page)
+            # Get pagination data for the next iteration
+            pag_data = data.get('result', {}).get('pagination', {})
+            next_page = check_pagination(pag_data)
         else:
+            print(f"Vendor {vendor} - API request failed, stopping pagination", flush=True)
             break  # Stop loop if API request fails
+    
+    if page_count >= max_pages:
+        print(f"Vendor {vendor} - Reached maximum page limit ({max_pages}), stopping pagination", flush=True)
+        safe_log(f"Vendor {vendor} - Reached maximum page limit, stopping pagination", logging.WARNING)
 
     # Filter Data - Updated to check for First Nine Images instead of First Image
     if len(All_data) > 0:
@@ -771,48 +787,68 @@ def main():
     print(f"⚙️  Concurrent vendors: {max_concurrent_vendors}")
     print("-" * 80)
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_vendors) as executor:
-        # Submit all vendor processing tasks
-        future_to_vendor = {}
-        
-        for vendor in vendors:
-            # First, process data for the vendor
-            data_future = executor.submit(process_vendor_data, vendor, start_date, end_date)
-            future_to_vendor[data_future] = vendor
-        
-        # Process completed data futures and start downloads immediately
-        for data_future in concurrent.futures.as_completed(future_to_vendor):
-            vendor = future_to_vendor[data_future]
-            completed_data_processing += 1
+    # Process vendors sequentially to avoid concurrency issues
+    for i, vendor in enumerate(vendors, 1):
+        try:
+            print(f"🔄 Processing vendor {i}/{len(vendors)}: {vendor}")
+            
+            # Add timeout for vendor processing
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError(f"Vendor {vendor} processing timed out")
+            
+            # Set timeout for vendor processing (5 minutes)
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(300)  # 5 minutes timeout
             
             try:
-                qualified_df = data_future.result()
-                if len(qualified_df) > 0:
-                    # Count total files for this vendor
-                    total_files = 0
-                    for index, row in qualified_df.iterrows():
-                        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
-                        if first_nine_images_str:
-                            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
-                            total_files += len(image_urls)
-                    
-                    # Update global progress tracker
-                    progress_tracker.total_files += total_files
-                    
-                    # Start async download process for this vendor immediately
-                    download_future = executor.submit(
-                        lambda: asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
-                    )
+                qualified_df = process_vendor_data(vendor, start_date, end_date)
+                signal.alarm(0)  # Cancel timeout
+            except TimeoutError as e:
+                signal.alarm(0)  # Cancel timeout
+                print(f"⏰ Vendor {vendor} - Processing timed out, skipping to next vendor")
+                safe_log(f"Vendor {vendor} - Processing timed out", logging.WARNING)
+                completed_data_processing += 1
+                continue
+            
+            completed_data_processing += 1
+            
+            if len(qualified_df) > 0:
+                # Count total files for this vendor
+                total_files = 0
+                for index, row in qualified_df.iterrows():
+                    first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                    if first_nine_images_str:
+                        image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                        total_files += len(image_urls)
+                
+                # Update global progress tracker
+                progress_tracker.total_files += total_files
+                
+                # Start async download process for this vendor
+                print(f"✅ Vendor {vendor} - Data processed ({completed_data_processing}/{len(vendors)}) | Files: {total_files} | Starting downloads...")
+                safe_log(f"Vendor {vendor} - Data processing completed, starting async downloads", logging.INFO)
+                
+                # Run async downloads with timeout
+                try:
+                    signal.alarm(600)  # 10 minutes timeout for downloads
+                    asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
+                    signal.alarm(0)  # Cancel timeout
                     started_downloads += 1
-                    
-                    print(f"✅ Vendor {vendor} - Data processed ({completed_data_processing}/{len(vendors)}) | Files: {total_files} | Downloads started")
-                    safe_log(f"Vendor {vendor} - Data processing completed, async downloads started immediately", logging.INFO)
-                else:
-                    print(f"⏭️  Vendor {vendor} - No qualified data ({completed_data_processing}/{len(vendors)})")
-                    safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
-            except Exception as e:
-                print(f"❌ Vendor {vendor} - Error: {e} ({completed_data_processing}/{len(vendors)})")
-                safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+                    print(f"✅ Vendor {vendor} - Downloads completed ({completed_data_processing}/{len(vendors)})")
+                except TimeoutError:
+                    signal.alarm(0)  # Cancel timeout
+                    print(f"⏰ Vendor {vendor} - Downloads timed out, moving to next vendor")
+                    safe_log(f"Vendor {vendor} - Downloads timed out", logging.WARNING)
+            else:
+                print(f"⏭️  Vendor {vendor} - No qualified data ({completed_data_processing}/{len(vendors)})")
+                safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
+                
+        except Exception as e:
+            print(f"❌ Vendor {vendor} - Error: {e} ({completed_data_processing}/{len(vendors)})")
+            safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+            completed_data_processing += 1
     
     print("-" * 80)
     print(f"🎉 All vendor processing completed!")
@@ -824,22 +860,26 @@ def main():
 
 def monitor_progress():
     """Monitor and display overall progress in a separate thread."""
-    while True:
-        if progress_tracker:
-            vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+    try:
+        while True:
+            if progress_tracker:
+                vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+                
+                # Only print if there's progress to show
+                if completed_files > 0 or failed_files > 0:
+                    elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                    print(f"\r📊 Overall Progress: Vendors {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} ({vendor_pct:.1f}%) | "
+                          f"Files {completed_files}/{progress_tracker.total_files} ({file_pct:.1f}%) | "
+                          f"Failed: {failed_files} | Time: {elapsed_str}", end="", flush=True)
+                
+                # Stop monitoring if all vendors are completed
+                if progress_tracker.completed_vendors >= progress_tracker.total_vendors:
+                    break
             
-            # Only print if there's progress to show
-            if completed_files > 0 or failed_files > 0:
-                elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
-                print(f"\r📊 Overall Progress: Vendors {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} ({vendor_pct:.1f}%) | "
-                      f"Files {completed_files}/{progress_tracker.total_files} ({file_pct:.1f}%) | "
-                      f"Failed: {failed_files} | Time: {elapsed_str}", end="", flush=True)
-            
-            # Stop monitoring if all vendors are completed
-            if progress_tracker.completed_vendors >= progress_tracker.total_vendors:
-                break
-        
-        time.sleep(2)  # Update every 2 seconds
+            time.sleep(2)  # Update every 2 seconds
+    except Exception as e:
+        print(f"\nProgress monitoring error: {e}", flush=True)
+        safe_log(f"Progress monitoring error: {e}", logging.ERROR)
 
 # Run the main process
 if __name__ == "__main__":
