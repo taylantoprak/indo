@@ -336,7 +336,7 @@ def process_vendor_data(vendor, start_date, end_date):
     data = request_data(vendor, start_date, end_date, next_page)
     totall = 0
     page_count = 0
-    max_pages = 100  # Safety limit to prevent infinite loops
+    consecutive_empty_pages = 0  # Track consecutive pages with no data
     
     if data:
         pag_data = data.get('result', {}).get('pagination', {})
@@ -350,7 +350,7 @@ def process_vendor_data(vendor, start_date, end_date):
         All_data = pd.concat([All_data, extracted_data], ignore_index=True)
 
     # Continue pagination while there are more pages
-    while next_page and page_count < max_pages:
+    while next_page:
         page_count += 1
         print(f"Vendor {vendor} - Processing page {page_count}", flush=True)
         
@@ -360,9 +360,22 @@ def process_vendor_data(vendor, start_date, end_date):
         # Check if the API request was successful
         if data:
             extracted_data = extract_data(data)
-            totall = totall + len(extracted_data)
-            print(f"Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
-            All_data = pd.concat([All_data, extracted_data], ignore_index=True)
+            
+            # Check if this page has any data
+            if len(extracted_data) > 0:
+                consecutive_empty_pages = 0  # Reset counter
+                totall = totall + len(extracted_data)
+                print(f"Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
+                All_data = pd.concat([All_data, extracted_data], ignore_index=True)
+            else:
+                consecutive_empty_pages += 1
+                print(f"Vendor {vendor} - Page {page_count} has no data (empty pages: {consecutive_empty_pages})", flush=True)
+                
+                # Stop if we get 3 consecutive empty pages (likely reached the end)
+                if consecutive_empty_pages >= 3:
+                    print(f"Vendor {vendor} - Stopping pagination: {consecutive_empty_pages} consecutive empty pages", flush=True)
+                    safe_log(f"Vendor {vendor} - Stopping pagination due to consecutive empty pages", logging.INFO)
+                    break
 
             # Get pagination data for the next iteration
             pag_data = data.get('result', {}).get('pagination', {})
@@ -370,10 +383,6 @@ def process_vendor_data(vendor, start_date, end_date):
         else:
             print(f"Vendor {vendor} - API request failed, stopping pagination", flush=True)
             break  # Stop loop if API request fails
-    
-    if page_count >= max_pages:
-        print(f"Vendor {vendor} - Reached maximum page limit ({max_pages}), stopping pagination", flush=True)
-        safe_log(f"Vendor {vendor} - Reached maximum page limit, stopping pagination", logging.WARNING)
 
     # Filter Data - Updated to check for First Nine Images instead of First Image
     if len(All_data) > 0:
