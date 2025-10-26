@@ -138,6 +138,7 @@ class ProgressTracker:
         self.lock = threading.Lock()
         self.vendor_progress = {}
         self.start_time = time.time()
+        self.active_vendors = set()
         
     def update_vendor_progress(self, vendor, completed, total, failed=0):
         with self.lock:
@@ -156,13 +157,19 @@ class ProgressTracker:
     def complete_vendor(self, vendor):
         with self.lock:
             self.completed_vendors += 1
+            if vendor in self.active_vendors:
+                self.active_vendors.remove(vendor)
+    
+    def start_vendor(self, vendor):
+        with self.lock:
+            self.active_vendors.add(vendor)
     
     def get_overall_progress(self):
         with self.lock:
             vendor_pct = (self.completed_vendors / self.total_vendors * 100) if self.total_vendors > 0 else 0
             file_pct = (self.completed_files / self.total_files * 100) if self.total_files > 0 else 0
             elapsed = time.time() - self.start_time
-            return vendor_pct, file_pct, elapsed, self.completed_files, self.failed_files
+            return vendor_pct, file_pct, elapsed, self.completed_files, self.failed_files, len(self.active_vendors)
 
 # Global progress tracker
 progress_tracker = None
@@ -763,12 +770,89 @@ def process_download(row, vendor, base_directory, failed_downloads):
 # Declare failed_downloads as a global variable
 failed_downloads = []
 
+def process_vendor_with_downloads(vendor, start_date, end_date, base_directory):
+    """Process a single vendor: fetch data and download images."""
+    try:
+        # Mark vendor as started in progress tracker
+        if progress_tracker:
+            progress_tracker.start_vendor(vendor)
+        
+        print(f"🔄 Processing vendor: {vendor}")
+        
+        # Add timeout for vendor processing
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"Vendor {vendor} processing timed out")
+        
+        # Set timeout for vendor processing (5 minutes)
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(300)  # 5 minutes timeout
+        
+        try:
+            qualified_df = process_vendor_data(vendor, start_date, end_date)
+            signal.alarm(0)  # Cancel timeout
+        except TimeoutError as e:
+            signal.alarm(0)  # Cancel timeout
+            print(f"⏰ Vendor {vendor} - Processing timed out, skipping to next vendor")
+            safe_log(f"Vendor {vendor} - Processing timed out", logging.WARNING)
+            if progress_tracker:
+                progress_tracker.complete_vendor(vendor)
+            return False
+        
+        if len(qualified_df) > 0:
+            # Count total files for this vendor
+            total_files = 0
+            for index, row in qualified_df.iterrows():
+                first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                if first_nine_images_str:
+                    image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                    total_files += len(image_urls)
+            
+            # Update global progress tracker
+            if progress_tracker:
+                progress_tracker.total_files += total_files
+            
+            # Start async download process for this vendor
+            print(f"✅ Vendor {vendor} - Data processed | Files: {total_files} | Starting downloads...")
+            safe_log(f"Vendor {vendor} - Data processing completed, starting async downloads", logging.INFO)
+            
+            # Run async downloads with timeout
+            try:
+                signal.alarm(600)  # 10 minutes timeout for downloads
+                asyncio.run(process_vendor_downloads_async(vendor, qualified_df, base_directory))
+                signal.alarm(0)  # Cancel timeout
+                print(f"✅ Vendor {vendor} - Downloads completed")
+                if progress_tracker:
+                    progress_tracker.complete_vendor(vendor)
+                return True
+            except TimeoutError:
+                signal.alarm(0)  # Cancel timeout
+                print(f"⏰ Vendor {vendor} - Downloads timed out, moving to next vendor")
+                safe_log(f"Vendor {vendor} - Downloads timed out", logging.WARNING)
+                if progress_tracker:
+                    progress_tracker.complete_vendor(vendor)
+                return False
+        else:
+            print(f"⏭️  Vendor {vendor} - No qualified data")
+            safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
+            if progress_tracker:
+                progress_tracker.complete_vendor(vendor)
+            return False
+            
+    except Exception as e:
+        print(f"❌ Vendor {vendor} - Error: {e}")
+        safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+        if progress_tracker:
+            progress_tracker.complete_vendor(vendor)
+        return False
+
 def main():
-    """Main function to process all vendors concurrently with immediate downloads and visual progress."""
+    """Main function to process vendors with staggered downloads (7 at a time)."""
     global progress_tracker
     
     print("=" * 80)
-    print("🎯 LUXURY IMAGE DOWNLOADER - ENHANCED VERSION")
+    print("🎯 LUXURY IMAGE DOWNLOADER - STAGGERED DOWNLOAD VERSION")
     print("=" * 80)
     print(f"📅 Date Range: {start_date} to {end_date}")
     print(f"🏪 Total Vendors: {len(vendors)}")
@@ -787,79 +871,87 @@ def main():
     # Initialize progress tracker
     progress_tracker = ProgressTracker(len(vendors))
     
-    # Process vendors with a maximum of 3 concurrent operations (reduced to save disk space)
-    max_concurrent_vendors = 3
-    completed_data_processing = 0
+    # Maximum concurrent vendors
+    max_concurrent_vendors = 7
+    completed_vendors = 0
     started_downloads = 0
     
-    print(f"\n🚀 Starting data processing and downloads...")
+    print(f"\n🚀 Starting staggered downloads...")
     print(f"⚙️  Concurrent vendors: {max_concurrent_vendors}")
     print("-" * 80)
     
-    # Process vendors sequentially to avoid concurrency issues
-    for i, vendor in enumerate(vendors, 1):
-        try:
-            print(f"🔄 Processing vendor {i}/{len(vendors)}: {vendor}")
-            
-            # Add timeout for vendor processing
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError(f"Vendor {vendor} processing timed out")
-            
-            # Set timeout for vendor processing (5 minutes)
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(300)  # 5 minutes timeout
-            
-            try:
-                qualified_df = process_vendor_data(vendor, start_date, end_date)
-                signal.alarm(0)  # Cancel timeout
-            except TimeoutError as e:
-                signal.alarm(0)  # Cancel timeout
-                print(f"⏰ Vendor {vendor} - Processing timed out, skipping to next vendor")
-                safe_log(f"Vendor {vendor} - Processing timed out", logging.WARNING)
-                completed_data_processing += 1
-                continue
-            
-            completed_data_processing += 1
-            
-            if len(qualified_df) > 0:
-                # Count total files for this vendor
-                total_files = 0
-                for index, row in qualified_df.iterrows():
-                    first_nine_images_str = str(row.get('First Nine Images', '')).strip()
-                    if first_nine_images_str:
-                        image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
-                        total_files += len(image_urls)
-                
-                # Update global progress tracker
-                progress_tracker.total_files += total_files
-                
-                # Start async download process for this vendor
-                print(f"✅ Vendor {vendor} - Data processed ({completed_data_processing}/{len(vendors)}) | Files: {total_files} | Starting downloads...")
-                safe_log(f"Vendor {vendor} - Data processing completed, starting async downloads", logging.INFO)
-                
-                # Run async downloads with timeout
-                try:
-                    signal.alarm(600)  # 10 minutes timeout for downloads
-                    asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
-                    signal.alarm(0)  # Cancel timeout
-                    started_downloads += 1
-                    print(f"✅ Vendor {vendor} - Downloads completed ({completed_data_processing}/{len(vendors)})")
-                except TimeoutError:
-                    signal.alarm(0)  # Cancel timeout
-                    print(f"⏰ Vendor {vendor} - Downloads timed out, moving to next vendor")
-                    safe_log(f"Vendor {vendor} - Downloads timed out", logging.WARNING)
-            else:
-                print(f"⏭️  Vendor {vendor} - No qualified data ({completed_data_processing}/{len(vendors)})")
-                safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
-                
-        except Exception as e:
-            print(f"❌ Vendor {vendor} - Error: {e} ({completed_data_processing}/{len(vendors)})")
-            safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
-            completed_data_processing += 1
+    # Create a queue of vendors to process
+    vendor_queue = vendors.copy()
+    active_downloads = []
     
-    print("-" * 80)
+    # Start initial batch of vendors
+    while len(active_downloads) < max_concurrent_vendors and vendor_queue:
+        vendor = vendor_queue.pop(0)
+        print(f"🚀 Starting vendor: {vendor}")
+        
+        # Start vendor processing in a separate thread
+        import threading
+        def run_vendor(vendor_name):
+            return process_vendor_with_downloads(vendor_name, start_date, end_date, os.getcwd())
+        
+        thread = threading.Thread(target=lambda: run_vendor(vendor))
+        thread.daemon = True
+        thread.start()
+        
+        active_downloads.append({
+            'vendor': vendor,
+            'thread': thread,
+            'start_time': time.time()
+        })
+    
+    # Monitor active downloads and start new ones as they complete
+    while active_downloads or vendor_queue:
+        completed_downloads = []
+        
+        for download in active_downloads:
+            if not download['thread'].is_alive():
+                # Thread has finished
+                completed_downloads.append(download)
+                completed_vendors += 1
+                started_downloads += 1
+                
+                elapsed_time = time.time() - download['start_time']
+                print(f"✅ Vendor {download['vendor']} completed in {elapsed_time:.1f}s")
+                
+                # Start next vendor if available
+                if vendor_queue:
+                    next_vendor = vendor_queue.pop(0)
+                    print(f"🚀 Starting next vendor: {next_vendor}")
+                    
+                    def run_vendor(vendor_name):
+                        return process_vendor_with_downloads(vendor_name, start_date, end_date, os.getcwd())
+                    
+                    thread = threading.Thread(target=lambda: run_vendor(next_vendor))
+                    thread.daemon = True
+                    thread.start()
+                    
+                    active_downloads.append({
+                        'vendor': next_vendor,
+                        'thread': thread,
+                        'start_time': time.time()
+                    })
+        
+        # Remove completed downloads
+        for download in completed_downloads:
+            active_downloads.remove(download)
+        
+        # Update progress
+        if progress_tracker:
+            vendor_pct, file_pct, elapsed, completed_files, failed_files, active_count = progress_tracker.get_overall_progress()
+            print(f"\r📊 Progress: {completed_vendors}/{len(vendors)} vendors | "
+                  f"Active: {active_count} | "
+                  f"Files: {completed_files}/{progress_tracker.total_files} | "
+                  f"Failed: {failed_files}", end="", flush=True)
+        
+        # Small delay to prevent excessive CPU usage
+        time.sleep(1)
+    
+    print("\n" + "-" * 80)
     print(f"🎉 All vendor processing completed!")
     print(f"📊 Started downloads for {started_downloads} vendors")
     print(f"📁 Total files to download: {progress_tracker.total_files}")
@@ -872,12 +964,13 @@ def monitor_progress():
     try:
         while True:
             if progress_tracker:
-                vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+                vendor_pct, file_pct, elapsed, completed_files, failed_files, active_count = progress_tracker.get_overall_progress()
                 
                 # Only print if there's progress to show
-                if completed_files > 0 or failed_files > 0:
+                if completed_files > 0 or failed_files > 0 or active_count > 0:
                     elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
                     print(f"\r📊 Overall Progress: Vendors {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} ({vendor_pct:.1f}%) | "
+                          f"Active: {active_count} | "
                           f"Files {completed_files}/{progress_tracker.total_files} ({file_pct:.1f}%) | "
                           f"Failed: {failed_files} | Time: {elapsed_str}", end="", flush=True)
                 
@@ -908,7 +1001,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print("🏁 Process completed!")
         if progress_tracker:
-            vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+            vendor_pct, file_pct, elapsed, completed_files, failed_files, active_count = progress_tracker.get_overall_progress()
             print(f"📈 Final Stats:")
             print(f"   • Vendors: {progress_tracker.completed_vendors}/{progress_tracker.total_vendors}")
             print(f"   • Files: {completed_files}/{progress_tracker.total_files}")
